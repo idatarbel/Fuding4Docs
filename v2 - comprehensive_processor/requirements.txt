@@ -1,0 +1,20 @@
+# Required Python packages for Medical Document Processing System
+
+# PDF processing and OCR
+PyPDF2>=3.0.0
+pytesseract>=0.3.10
+pymupdf>=1.23.0
+Pillow>=10.0.0
+
+# HTTP requests for AI model communication
+requests>=2.31.0
+
+# Standard library packages (usually included with Python)
+# configparser - for configuration file handling
+# pathlib - for file path operations
+# logging - for application logging
+# csv - for CSV file operations
+# json - for JSON data handling
+# time - for timing operations
+# argparse - for command line argument parsing
+# typing - for type hints

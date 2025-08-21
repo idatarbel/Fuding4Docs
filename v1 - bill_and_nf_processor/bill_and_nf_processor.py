@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Combined Bill Processing System
+Multi-Document Processing System
 
-This program processes medical bills through the complete pipeline:
+This program processes various document types through a complete pipeline:
 1. Mirrors source directory structure to output directory
-2. Converts PDF bills to text using OCR
+2. Converts PDF documents to text using OCR
 3. Extracts structured data using AI
-4. Outputs results to CSV
+4. Outputs results to separate CSV files by document type
 
 Required packages:
 pip install PyPDF2 pytesseract pymupdf pillow requests configparser
@@ -43,16 +43,16 @@ except ImportError as e:
     sys.exit(1)
 
 
-class BillProcessor:
+class DocumentProcessor:
     def __init__(self, config_file: str = "config.ini"):
-        """Initialize the bill processor with configuration."""
+        """Initialize the document processor with configuration."""
         self.config_file = config_file
         self.config = self.load_config()
         self.model_name = "qwen2.5:14b"
         self.ollama_url = "http://localhost:11434"
         self.setup_logging()
         self.check_model_available()
-        self.bill_results = []  # Store all extracted bill data
+        self.document_types = self.get_document_types()
     
     def load_config(self) -> Dict:
         """Load configuration from config.ini file."""
@@ -76,15 +76,6 @@ class BillProcessor:
             print("Error: source_directory and output_directory must be specified in config.ini")
             sys.exit(1)
         
-        # Get medical_bill fields from FileTypes section
-        medical_bill_fields = []
-        if 'FileTypes' in config and 'medical_bill' in config['FileTypes']:
-            fields_str = config['FileTypes']['medical_bill']
-            medical_bill_fields = [field.strip() for field in fields_str.split('`')]
-        else:
-            print("Error: [FileTypes] section with medical_bill entry required in config.ini")
-            sys.exit(1)
-        
         # Get ignore_hash_paths setting
         ignore_hash_paths = general.getboolean('ignore_hash_paths', fallback=False)
         
@@ -93,9 +84,47 @@ class BillProcessor:
             'output_directory': output_dir,
             'log_directory': general.get('log_directory', './logs').strip(),
             'verbose': general.getboolean('verbose', fallback=False),
-            'ignore_hash_paths': ignore_hash_paths,
-            'medical_bill_fields': medical_bill_fields
+            'ignore_hash_paths': ignore_hash_paths
         }
+    
+    def get_document_types(self) -> Dict:
+        """Extract document types and their configurations from config.ini."""
+        config = configparser.ConfigParser()
+        config.read(self.config_file)
+        
+        document_types = {}
+        
+        if 'FileTypes' not in config:
+            print("Error: [FileTypes] section required in config.ini")
+            sys.exit(1)
+        
+        file_types = config['FileTypes']
+        
+        # Find all document type entries and their search criteria
+        for key, value in file_types.items():
+            if key.endswith('_search_criteria'):
+                # This is a search criteria entry
+                doc_type = key.replace('_search_criteria', '')
+                search_terms = [term.strip().lower() for term in value.split(',')]
+                
+                # Check if corresponding field definition exists
+                if doc_type in file_types:
+                    fields_str = file_types[doc_type]
+                    fields = [field.strip() for field in fields_str.split('`')]
+                    
+                    document_types[doc_type] = {
+                        'search_criteria': search_terms,
+                        'fields': fields,
+                        'output_file': f"{doc_type}.csv"
+                    }
+                else:
+                    print(f"Warning: Found search criteria for '{doc_type}' but no field definition")
+        
+        if not document_types:
+            print("Error: No valid document type configurations found")
+            sys.exit(1)
+        
+        return document_types
     
     def setup_logging(self):
         """Set up logging configuration."""
@@ -103,7 +132,7 @@ class BillProcessor:
         
         log_dir = Path(self.config['log_directory'])
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / 'bill_processor.log'
+        log_file = log_dir / 'document_processor.log'
         
         logging.basicConfig(
             level=level,
@@ -166,40 +195,49 @@ class BillProcessor:
         print(f"✓ Created {directories_created} directories in output structure")
         return directories_created
     
-    def find_bill_pdfs(self) -> List[Path]:
-        """Find all PDF files containing 'bill' in the filename."""
-        print("STEP 2: Finding PDF bills...")
+    def find_pdfs_by_type(self) -> Dict[str, List[Path]]:
+        """Find PDF files for each document type based on search criteria."""
+        print("STEP 2: Finding PDF files by document type...")
         
         source_path = Path(self.config['source_directory'])
-        bill_pdfs = []
+        pdfs_by_type = {doc_type: [] for doc_type in self.document_types.keys()}
         ignored_count = 0
         
         for root, dirs, files in os.walk(source_path):
             for file in files:
-                if (file.lower().endswith('.pdf') and 
-                    'bill' in file.lower()):
-                    bill_path = Path(root) / file
+                if file.lower().endswith('.pdf'):
+                    file_path = Path(root) / file
                     
                     # Check if we should ignore paths with directories starting with '#'
                     if self.config['ignore_hash_paths']:
-                        # Check if any directory in the path starts with '#'
-                        path_parts = bill_path.parts
-                        has_hash_start = any(part.startswith('#') for part in path_parts[:-1])  # Exclude filename itself
+                        path_parts = file_path.parts
+                        has_hash_start = any(part.startswith('#') for part in path_parts[:-1])
                         
                         if has_hash_start:
                             ignored_count += 1
-                            logging.info(f"Ignored bill PDF (hash directory): {bill_path}")
+                            logging.info(f"Ignored PDF (hash directory): {file_path}")
                             continue
                     
-                    bill_pdfs.append(bill_path)
-                    logging.info(f"Found bill PDF: {bill_path}")
+                    # Check which document type this file matches
+                    file_lower = file.lower()
+                    for doc_type, config in self.document_types.items():
+                        search_terms = config['search_criteria']
+                        if any(term in file_lower for term in search_terms):
+                            pdfs_by_type[doc_type].append(file_path)
+                            logging.info(f"Found {doc_type} PDF: {file_path}")
+                            break  # Only classify as first matching type
+        
+        # Print summary
+        total_found = sum(len(pdfs) for pdfs in pdfs_by_type.values())
+        print(f"✓ Found {total_found} PDF files by type:")
+        for doc_type, pdfs in pdfs_by_type.items():
+            search_terms = ', '.join(self.document_types[doc_type]['search_criteria'])
+            print(f"  - {doc_type} ({search_terms}): {len(pdfs)} files")
         
         if self.config['ignore_hash_paths']:
-            print(f"✓ Found {len(bill_pdfs)} bill PDFs (ignored {ignored_count} with directories starting with '#')")
-        else:
-            print(f"✓ Found {len(bill_pdfs)} bill PDFs")
+            print(f"  - Ignored {ignored_count} files in directories starting with '#'")
         
-        return bill_pdfs
+        return pdfs_by_type
     
     def extract_text_from_pdf(self, pdf_path: Path) -> str:
         """Extract text from PDF using PyPDF2 first, then OCR if needed."""
@@ -297,55 +335,63 @@ class BillProcessor:
             # Return a minimal text to avoid complete failure
             return f"OCR_FAILED: Unable to extract text from {pdf_path.name}"
     
-    def convert_bills_to_text(self, bill_pdfs: List[Path]) -> List[Tuple[Path, Path]]:
-        """Convert all bill PDFs to text files in output directory."""
-        print("STEP 2: Converting PDF bills to text...")
+    def convert_pdfs_to_text(self, pdfs_by_type: Dict[str, List[Path]]) -> Dict[str, List[Tuple[Path, Path]]]:
+        """Convert all PDF files to text files in output directory."""
+        print("STEP 2: Converting PDF files to text...")
         
         source_path = Path(self.config['source_directory'])
         output_path = Path(self.config['output_directory'])
-        converted_bills = []
+        converted_by_type = {}
         
-        total_bills = len(bill_pdfs)
-        
-        for i, pdf_path in enumerate(bill_pdfs, 1):
-            try:
-                print(f"Converting {i}/{total_bills}: {pdf_path.name}")
-                
-                # Calculate relative path and output location
-                rel_path = pdf_path.relative_to(source_path)
-                output_file = output_path / rel_path.with_suffix('.pdf.txt')
-                
-                # Skip if already converted (for resuming)
-                if output_file.exists():
-                    logging.info(f"Already exists, skipping: {output_file}")
-                    converted_bills.append((pdf_path, output_file))
-                    continue
-                
-                # Extract text from PDF with timeout protection
-                start_time = time.time()
-                text_content = self.extract_text_from_pdf(pdf_path)
-                elapsed = time.time() - start_time
-                
-                if text_content and len(text_content.strip()) > 50:  # Ensure we have meaningful content
-                    # Write text file
-                    with open(output_file, 'w', encoding='utf-8') as f:
-                        f.write(f"Source: {pdf_path}\n")
-                        f.write("=" * 50 + "\n\n")
-                        f.write(text_content)
+        for doc_type, pdf_list in pdfs_by_type.items():
+            if not pdf_list:
+                converted_by_type[doc_type] = []
+                continue
+            
+            print(f"\nProcessing {doc_type} documents:")
+            converted_files = []
+            
+            for i, pdf_path in enumerate(pdf_list, 1):
+                try:
+                    print(f"  Converting {i}/{len(pdf_list)}: {pdf_path.name}")
                     
-                    converted_bills.append((pdf_path, output_file))
-                    logging.info(f"Converted in {elapsed:.1f}s: {pdf_path} -> {output_file}")
-                    print(f"  ✓ Converted in {elapsed:.1f}s ({len(text_content)} chars)")
-                else:
-                    logging.error(f"Failed to extract meaningful text from: {pdf_path}")
-                    print(f"  ✗ No meaningful text extracted")
+                    # Calculate relative path and output location
+                    rel_path = pdf_path.relative_to(source_path)
+                    output_file = output_path / rel_path.with_suffix('.pdf.txt')
                     
-            except Exception as e:
-                logging.error(f"Error converting {pdf_path}: {e}")
-                print(f"  ✗ Error: {e}")
+                    # Skip if already converted (for resuming)
+                    if output_file.exists():
+                        logging.info(f"Already exists, skipping: {output_file}")
+                        converted_files.append((pdf_path, output_file))
+                        continue
+                    
+                    # Extract text from PDF with timeout protection
+                    start_time = time.time()
+                    text_content = self.extract_text_from_pdf(pdf_path)
+                    elapsed = time.time() - start_time
+                    
+                    if text_content and len(text_content.strip()) > 50:  # Ensure we have meaningful content
+                        # Write text file
+                        with open(output_file, 'w', encoding='utf-8') as f:
+                            f.write(f"Source: {pdf_path}\n")
+                            f.write("=" * 50 + "\n\n")
+                            f.write(text_content)
+                        
+                        converted_files.append((pdf_path, output_file))
+                        logging.info(f"Converted in {elapsed:.1f}s: {pdf_path} -> {output_file}")
+                        print(f"    ✓ Converted in {elapsed:.1f}s ({len(text_content)} chars)")
+                    else:
+                        logging.error(f"Failed to extract meaningful text from: {pdf_path}")
+                        print(f"    ✗ No meaningful text extracted")
+                        
+                except Exception as e:
+                    logging.error(f"Error converting {pdf_path}: {e}")
+                    print(f"    ✗ Error: {e}")
+            
+            converted_by_type[doc_type] = converted_files
+            print(f"  ✓ Converted {len(converted_files)} {doc_type} files to text")
         
-        print(f"✓ Converted {len(converted_bills)} bills to text")
-        return converted_bills
+        return converted_by_type
     
     def query_model(self, prompt: str) -> str:
         """Query the qwen2.5:14b model."""
@@ -376,11 +422,11 @@ class BillProcessor:
         except Exception as e:
             raise Exception(f"Error querying model: {e}")
     
-    def create_extraction_prompt(self, content: str, fields: List[str]) -> str:
-        """Create prompt for extracting bill information."""
+    def create_extraction_prompt(self, content: str, fields: List[str], doc_type: str) -> str:
+        """Create prompt for extracting document information."""
         fields_list = '\n'.join([f"- {field}" for field in fields])
         
-        return f"""TASK: Extract medical billing information from this document.
+        return f"""TASK: Extract information from this {doc_type.replace('_', ' ')} document.
 
 DOCUMENT:
 {content}
@@ -425,11 +471,8 @@ EXTRACT NOW:"""
         
         return extracted
     
-    def write_csv_record(self, result: Dict, is_first_record: bool = False):
+    def write_csv_record(self, result: Dict, output_file: str, fields: List[str], is_first_record: bool = False):
         """Write a single result to CSV immediately."""
-        fields = self.config['medical_bill_fields']
-        output_file = "output.csv"
-        
         # CSV headers as specified
         headers = [
             'absolute file path',
@@ -446,7 +489,7 @@ EXTRACT NOW:"""
             # Write headers only for the very first record
             if is_first_record and not file_exists:
                 writer.writerow(headers)
-                print(f"Created {output_file} with headers")
+                print(f"    Created {output_file} with headers")
             
             # Write data row
             if result.get('success'):
@@ -462,7 +505,7 @@ EXTRACT NOW:"""
                     row.append(value)
                 
                 writer.writerow(row)
-                print(f"  → Added record to output.csv")
+                print(f"    → Added record to {output_file}")
             else:
                 # Write error row
                 error_row = [
@@ -472,123 +515,142 @@ EXTRACT NOW:"""
                 ]
                 error_row.extend([''] * len(fields))
                 writer.writerow(error_row)
-                print(f"  → Added error record to output.csv")
+                print(f"    → Added error record to {output_file}")
     
-    def process_all_bills(self):
-        """Run the complete bill processing pipeline."""
+    def process_document_type(self, doc_type: str, text_files: List[Tuple[Path, Path]]):
+        """Process all files of a specific document type."""
+        if not text_files:
+            print(f"  No {doc_type} text files to process.")
+            return []
+        
+        print(f"\n  Processing {doc_type} documents:")
+        
+        doc_config = self.document_types[doc_type]
+        fields = doc_config['fields']
+        output_file = doc_config['output_file']
+        
+        all_results = []
+        total_files = len(text_files)
+        first_record = True
+        
+        for i, (original_pdf, text_file) in enumerate(text_files, 1):
+            try:
+                print(f"    Processing {i}/{total_files}: {text_file.name}")
+                
+                # Read text file
+                with open(text_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                
+                # Limit content size for model processing
+                if len(content) > 8000:
+                    content = content[:8000] + "\n[Content truncated...]"
+                
+                # Create extraction prompt
+                prompt = self.create_extraction_prompt(content, fields, doc_type)
+                
+                # Query model
+                start_time = time.time()
+                ai_response = self.query_model(prompt)
+                elapsed = time.time() - start_time
+                
+                # Parse response
+                extracted_data = self.parse_extraction_response(ai_response, fields)
+                
+                # Store result
+                result = {
+                    'success': True,
+                    'original_pdf': str(original_pdf.resolve()),  # Absolute path
+                    'text_file': str(text_file),
+                    'file_type': doc_type,
+                    'model_used': self.model_name,
+                    'response_time': f"{elapsed:.1f}s",
+                    'extracted_data': extracted_data,
+                    'raw_response': ai_response
+                }
+                
+                # Write to CSV immediately
+                self.write_csv_record(result, output_file, fields, is_first_record=first_record)
+                first_record = False
+                
+                all_results.append(result)
+                
+                # Show progress
+                found_count = sum(1 for v in extracted_data.values() if v != "NOT FOUND")
+                print(f"    ✓ Extracted {found_count}/{len(fields)} fields ({elapsed:.1f}s)")
+                
+                logging.info(f"Processed {text_file}: {found_count}/{len(fields)} fields")
+                
+            except Exception as e:
+                error_result = {
+                    'success': False,
+                    'original_pdf': str(original_pdf.resolve()),
+                    'text_file': str(text_file),
+                    'file_type': doc_type,
+                    'error': str(e)
+                }
+                
+                # Write error to CSV immediately
+                self.write_csv_record(error_result, output_file, fields, is_first_record=first_record)
+                first_record = False
+                
+                all_results.append(error_result)
+                print(f"    ✗ Error: {e}")
+                logging.error(f"Error processing {text_file}: {e}")
+        
+        print(f"    ✓ Processed {len(all_results)} {doc_type} files")
+        return all_results
+    
+    def process_all_documents(self):
+        """Run the complete document processing pipeline."""
         print("="*70)
-        print("BILL PROCESSING PIPELINE")
+        print("MULTI-DOCUMENT PROCESSING PIPELINE")
         print("="*70)
         print(f"Source: {self.config['source_directory']}")
         print(f"Output: {self.config['output_directory']}")
         print(f"Model: {self.model_name}")
         print(f"Log: {self.log_file}")
+        print(f"Document Types: {list(self.document_types.keys())}")
         print("="*70)
         
         try:
             # Step 1: Mirror directory structure
             self.mirror_directory_structure()
             
-            # Step 2a: Find bill PDFs
-            bill_pdfs = self.find_bill_pdfs()
-            if not bill_pdfs:
-                print("No bill PDFs found. Processing complete.")
+            # Step 2a: Find PDFs by type
+            pdfs_by_type = self.find_pdfs_by_type()
+            if not any(pdfs_by_type.values()):
+                print("No PDF files found for any document type. Processing complete.")
                 return
             
             # Step 2b: Convert PDFs to text
-            text_files = self.convert_bills_to_text(bill_pdfs)
-            if not text_files:
-                print("No bills were successfully converted. Processing complete.")
-                return
+            text_files_by_type = self.convert_pdfs_to_text(pdfs_by_type)
             
-            # Step 3: Extract data using AI (with immediate CSV writing)
-            if not text_files:
-                print("No text files to process.")
-                return
-                
-            print("STEP 3: Extracting bill data using qwen2.5:14b...")
+            # Step 3: Extract data using AI for each document type
+            print("\nSTEP 3: Extracting data using qwen2.5:14b...")
             
-            fields = self.config['medical_bill_fields']
-            all_results = []
-            
-            total_files = len(text_files)
-            first_record = True
-            
-            for i, (original_pdf, text_file) in enumerate(text_files, 1):
-                try:
-                    print(f"Processing {i}/{total_files}: {text_file.name}")
-                    
-                    # Read text file
-                    with open(text_file, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                    
-                    # Limit content size for model processing
-                    if len(content) > 8000:
-                        content = content[:8000] + "\n[Content truncated...]"
-                    
-                    # Create extraction prompt
-                    prompt = self.create_extraction_prompt(content, fields)
-                    
-                    # Query model
-                    start_time = time.time()
-                    ai_response = self.query_model(prompt)
-                    elapsed = time.time() - start_time
-                    
-                    # Parse response
-                    extracted_data = self.parse_extraction_response(ai_response, fields)
-                    
-                    # Store result
-                    result = {
-                        'success': True,
-                        'original_pdf': str(original_pdf.resolve()),  # Absolute path
-                        'text_file': str(text_file),
-                        'file_type': 'medical_bill',
-                        'model_used': self.model_name,
-                        'response_time': f"{elapsed:.1f}s",
-                        'extracted_data': extracted_data,
-                        'raw_response': ai_response
-                    }
-                    
-                    # Write to CSV immediately
-                    self.write_csv_record(result, is_first_record=first_record)
-                    first_record = False
-                    
-                    all_results.append(result)
-                    
-                    # Show progress
-                    found_count = sum(1 for v in extracted_data.values() if v != "NOT FOUND")
-                    print(f"  ✓ Extracted {found_count}/{len(fields)} fields ({elapsed:.1f}s)")
-                    
-                    logging.info(f"Processed {text_file}: {found_count}/{len(fields)} fields")
-                    
-                except Exception as e:
-                    error_result = {
-                        'success': False,
-                        'original_pdf': str(original_pdf.resolve()),
-                        'text_file': str(text_file),
-                        'error': str(e)
-                    }
-                    
-                    # Write error to CSV immediately
-                    self.write_csv_record(error_result, is_first_record=first_record)
-                    first_record = False
-                    
-                    all_results.append(error_result)
-                    print(f"  ✗ Error: {e}")
-                    logging.error(f"Error processing {text_file}: {e}")
-            
-            print(f"\n✓ Processed {len(all_results)} bill files total")
-            results = all_results
+            all_results_by_type = {}
+            for doc_type in self.document_types.keys():
+                text_files = text_files_by_type.get(doc_type, [])
+                results = self.process_document_type(doc_type, text_files)
+                all_results_by_type[doc_type] = results
             
             # Summary
-            successful = sum(1 for r in results if r.get('success'))
-            print("="*70)
+            print("\n" + "="*70)
             print("PROCESSING COMPLETE")
             print("="*70)
-            print(f"Total bills found: {len(bill_pdfs)}")
-            print(f"Successfully converted: {len(text_files)}")
-            print(f"Successfully processed: {successful}")
-            print(f"Output file: output.csv (written incrementally)")
+            
+            total_pdfs = sum(len(pdfs) for pdfs in pdfs_by_type.values())
+            total_converted = sum(len(files) for files in text_files_by_type.values())
+            
+            print(f"Total PDF files found: {total_pdfs}")
+            print(f"Successfully converted to text: {total_converted}")
+            
+            for doc_type in self.document_types.keys():
+                results = all_results_by_type.get(doc_type, [])
+                successful = sum(1 for r in results if r.get('success'))
+                output_file = self.document_types[doc_type]['output_file']
+                print(f"  {doc_type}: {successful} processed → {output_file}")
+            
             print(f"Log file: {self.log_file}")
             
         except Exception as e:
@@ -599,27 +661,26 @@ EXTRACT NOW:"""
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Process medical bills from PDF to structured CSV data",
+        description="Process multiple document types from PDF to structured CSV data",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-This program processes medical bills through a complete pipeline:
+This program processes multiple document types through a complete pipeline:
 
 1. Mirrors source directory structure to output directory
-2. Finds PDF files containing 'bill' in filename
+2. Finds PDF files based on configurable search criteria
 3. Converts PDFs to text using OCR
 4. Extracts structured data using qwen2.5:14b AI model
-5. Outputs results to CSV file
+5. Outputs results to separate CSV files by document type
 
 Requirements:
 - config.ini with [General] and [FileTypes] sections
 - Tesseract OCR installed
 - Ollama running with qwen2.5:14b model
-- PDF files with 'bill' in filename
 
 Output:
 - Mirrored directory structure in output directory
-- Text files (.pdf.txt) for each bill
-- output.csv with extracted structured data
+- Text files (.pdf.txt) for each document
+- Separate CSV files for each document type
         """
     )
     
@@ -637,12 +698,12 @@ Output:
     args = parser.parse_args()
     
     try:
-        processor = BillProcessor(config_file=args.config)
+        processor = DocumentProcessor(config_file=args.config)
         if args.verbose:
             processor.config['verbose'] = True
             processor.setup_logging()
         
-        processor.process_all_bills()
+        processor.process_all_documents()
         
     except KeyboardInterrupt:
         print("\nProcessing interrupted by user.")
