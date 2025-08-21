@@ -204,6 +204,7 @@ class BillProcessor:
     
     def ocr_pdf_to_text(self, pdf_path: Path) -> str:
         """Convert PDF to text using OCR with PyMuPDF and timeout protection."""
+        pdf_document = None
         try:
             logging.info(f"Using OCR for {pdf_path}")
             pdf_document = fitz.open(str(pdf_path))
@@ -236,8 +237,6 @@ class BillProcessor:
                     logging.warning(f"Failed to OCR page {page_num+1} of {pdf_path}: {page_error}")
                     continue
             
-            pdf_document.close()
-            
             if len(pdf_document) > max_pages:
                 text += f"\n[Only first {max_pages} pages processed for efficiency]"
             
@@ -246,6 +245,13 @@ class BillProcessor:
         except Exception as e:
             logging.error(f"OCR failed for {pdf_path}: {e}")
             return ""
+        finally:
+            # Ensure document is always closed
+            if pdf_document is not None:
+                try:
+                    pdf_document.close()
+                except:
+                    pass
     
     def convert_bills_to_text(self, bill_pdfs: List[Path]) -> List[Tuple[Path, Path]]:
         """Convert all bill PDFs to text files in output directory."""
