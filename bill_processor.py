@@ -85,11 +85,15 @@ class BillProcessor:
             print("Error: [FileTypes] section with medical_bill entry required in config.ini")
             sys.exit(1)
         
+        # Get ignore_hash_paths setting
+        ignore_hash_paths = general.getboolean('ignore_hash_paths', fallback=False)
+        
         return {
             'source_directory': source_dir,
             'output_directory': output_dir,
             'log_directory': general.get('log_directory', './logs').strip(),
             'verbose': general.getboolean('verbose', fallback=False),
+            'ignore_hash_paths': ignore_hash_paths,
             'medical_bill_fields': medical_bill_fields
         }
     
@@ -168,90 +172,130 @@ class BillProcessor:
         
         source_path = Path(self.config['source_directory'])
         bill_pdfs = []
+        ignored_count = 0
         
         for root, dirs, files in os.walk(source_path):
             for file in files:
                 if (file.lower().endswith('.pdf') and 
                     'bill' in file.lower()):
                     bill_path = Path(root) / file
+                    
+                    # Check if we should ignore paths with directories starting with '#'
+                    if self.config['ignore_hash_paths']:
+                        # Check if any directory in the path starts with '#'
+                        path_parts = bill_path.parts
+                        has_hash_start = any(part.startswith('#') for part in path_parts[:-1])  # Exclude filename itself
+                        
+                        if has_hash_start:
+                            ignored_count += 1
+                            logging.info(f"Ignored bill PDF (hash directory): {bill_path}")
+                            continue
+                    
                     bill_pdfs.append(bill_path)
                     logging.info(f"Found bill PDF: {bill_path}")
         
-        print(f"✓ Found {len(bill_pdfs)} bill PDFs")
+        if self.config['ignore_hash_paths']:
+            print(f"✓ Found {len(bill_pdfs)} bill PDFs (ignored {ignored_count} with directories starting with '#')")
+        else:
+            print(f"✓ Found {len(bill_pdfs)} bill PDFs")
+        
         return bill_pdfs
     
     def extract_text_from_pdf(self, pdf_path: Path) -> str:
         """Extract text from PDF using PyPDF2 first, then OCR if needed."""
+        # Try text extraction first
         try:
-            # Try text extraction first
             with open(pdf_path, 'rb') as file:
                 pdf_reader = PyPDF2.PdfReader(file)
                 text = ""
                 
-                for page_num in range(len(pdf_reader.pages)):
+                for page_num in range(min(len(pdf_reader.pages), 5)):  # Limit to 5 pages
                     page = pdf_reader.pages[page_num]
-                    text += page.extract_text() + "\n"
+                    page_text = page.extract_text()
+                    if page_text:
+                        text += page_text + "\n"
                 
                 # Check if extraction was meaningful
-                if text.strip() and len(text.split()) >= 10:
+                if text.strip() and len(text.split()) >= 20:
                     logging.info(f"Using text extraction for {pdf_path}")
                     return text.strip()
+                else:
+                    logging.info(f"Text extraction insufficient for {pdf_path}, trying OCR")
         except Exception as e:
             logging.warning(f"Text extraction failed for {pdf_path}: {e}")
         
-        # Fall back to OCR
-        return self.ocr_pdf_to_text(pdf_path)
+        # Fall back to OCR with better error handling
+        return self.ocr_pdf_to_text_robust(pdf_path)
     
-    def ocr_pdf_to_text(self, pdf_path: Path) -> str:
-        """Convert PDF to text using OCR with PyMuPDF and timeout protection."""
-        pdf_document = None
+    def ocr_pdf_to_text_robust(self, pdf_path: Path) -> str:
+        """Convert PDF to text using OCR with robust error handling."""
         try:
             logging.info(f"Using OCR for {pdf_path}")
-            pdf_document = fitz.open(str(pdf_path))
-            text = ""
             
-            # Limit number of pages to process (for very long documents)
-            max_pages = min(len(pdf_document), 10)  # Process max 10 pages
-            
-            for page_num in range(max_pages):
-                try:
-                    logging.debug(f"OCR processing page {page_num+1} of {pdf_path}")
-                    
-                    page = pdf_document[page_num]
-                    mat = fitz.Matrix(1.5, 1.5)  # Reduced zoom for speed
-                    pix = page.get_pixmap(matrix=mat)
-                    
-                    img_data = pix.tobytes("ppm")
-                    image = Image.open(io.BytesIO(img_data))
-                    
-                    # Add timeout for tesseract
-                    page_text = pytesseract.image_to_string(image, lang='eng', timeout=30)
-                    text += f"--- Page {page_num+1} ---\n{page_text}\n\n"
-                    
-                    # Break if we have enough text (avoid processing unnecessary pages)
-                    if len(text) > 5000:
-                        logging.info(f"Sufficient text extracted from {pdf_path}, stopping at page {page_num+1}")
-                        break
+            # Open document with context manager for proper cleanup
+            with fitz.open(str(pdf_path)) as pdf_document:
+                text_parts = []
+                
+                # Process maximum 3 pages for efficiency
+                max_pages = min(len(pdf_document), 3)
+                
+                for page_num in range(max_pages):
+                    try:
+                        logging.debug(f"OCR processing page {page_num+1}/{max_pages} of {pdf_path.name}")
                         
-                except Exception as page_error:
-                    logging.warning(f"Failed to OCR page {page_num+1} of {pdf_path}: {page_error}")
-                    continue
-            
-            if len(pdf_document) > max_pages:
-                text += f"\n[Only first {max_pages} pages processed for efficiency]"
-            
-            return text.strip()
-            
+                        # Get the page
+                        page = pdf_document[page_num]
+                        
+                        # Create pixmap with reasonable resolution
+                        mat = fitz.Matrix(1.2, 1.2)  # Lower resolution for speed
+                        pix = page.get_pixmap(matrix=mat)
+                        
+                        # Convert to PIL Image
+                        img_data = pix.tobytes("ppm")
+                        
+                        # Process with PIL
+                        with Image.open(io.BytesIO(img_data)) as image:
+                            # Use OCR with timeout
+                            try:
+                                page_text = pytesseract.image_to_string(
+                                    image, 
+                                    lang='eng',
+                                    timeout=20,
+                                    config='--psm 6'  # Assume uniform block of text
+                                )
+                                
+                                if page_text.strip():
+                                    text_parts.append(f"--- Page {page_num+1} ---\n{page_text.strip()}")
+                                    
+                                    # Stop if we have enough text
+                                    combined_text = '\n\n'.join(text_parts)
+                                    if len(combined_text) > 3000:
+                                        logging.info(f"Sufficient text extracted from {pdf_path.name}")
+                                        break
+                                        
+                            except pytesseract.TesseractError as ocr_error:
+                                logging.warning(f"OCR failed on page {page_num+1} of {pdf_path}: {ocr_error}")
+                                continue
+                                
+                        # Clean up pixmap
+                        pix = None
+                        
+                    except Exception as page_error:
+                        logging.warning(f"Failed to process page {page_num+1} of {pdf_path}: {page_error}")
+                        continue
+                
+                # Combine all text parts
+                final_text = '\n\n'.join(text_parts)
+                
+                if max_pages < len(pdf_document):
+                    final_text += f"\n\n[Processed {max_pages} of {len(pdf_document)} pages]"
+                
+                return final_text.strip()
+                
         except Exception as e:
-            logging.error(f"OCR failed for {pdf_path}: {e}")
-            return ""
-        finally:
-            # Ensure document is always closed
-            if pdf_document is not None:
-                try:
-                    pdf_document.close()
-                except:
-                    pass
+            logging.error(f"OCR completely failed for {pdf_path}: {e}")
+            # Return a minimal text to avoid complete failure
+            return f"OCR_FAILED: Unable to extract text from {pdf_path.name}"
     
     def convert_bills_to_text(self, bill_pdfs: List[Path]) -> List[Tuple[Path, Path]]:
         """Convert all bill PDFs to text files in output directory."""
@@ -282,7 +326,7 @@ class BillProcessor:
                 text_content = self.extract_text_from_pdf(pdf_path)
                 elapsed = time.time() - start_time
                 
-                if text_content:
+                if text_content and len(text_content.strip()) > 50:  # Ensure we have meaningful content
                     # Write text file
                     with open(output_file, 'w', encoding='utf-8') as f:
                         f.write(f"Source: {pdf_path}\n")
@@ -291,10 +335,10 @@ class BillProcessor:
                     
                     converted_bills.append((pdf_path, output_file))
                     logging.info(f"Converted in {elapsed:.1f}s: {pdf_path} -> {output_file}")
-                    print(f"  ✓ Converted in {elapsed:.1f}s")
+                    print(f"  ✓ Converted in {elapsed:.1f}s ({len(text_content)} chars)")
                 else:
-                    logging.error(f"Failed to extract text from: {pdf_path}")
-                    print(f"  ✗ Failed to extract text")
+                    logging.error(f"Failed to extract meaningful text from: {pdf_path}")
+                    print(f"  ✗ No meaningful text extracted")
                     
             except Exception as e:
                 logging.error(f"Error converting {pdf_path}: {e}")
@@ -381,73 +425,8 @@ EXTRACT NOW:"""
         
         return extracted
     
-    def extract_bill_data(self, text_files: List[Tuple[Path, Path]]) -> List[Dict]:
-        """Extract structured data from bill text files using AI."""
-        print("STEP 3: Extracting bill data using qwen2.5:14b...")
-        
-        fields = self.config['medical_bill_fields']
-        results = []
-        
-        for original_pdf, text_file in text_files:
-            try:
-                print(f"Processing: {text_file}")
-                
-                # Read text file
-                with open(text_file, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                
-                # Limit content size for model processing
-                if len(content) > 8000:
-                    content = content[:8000] + "\n[Content truncated...]"
-                
-                # Create extraction prompt
-                prompt = self.create_extraction_prompt(content, fields)
-                
-                # Query model
-                start_time = time.time()
-                ai_response = self.query_model(prompt)
-                elapsed = time.time() - start_time
-                
-                # Parse response
-                extracted_data = self.parse_extraction_response(ai_response, fields)
-                
-                # Store result
-                result = {
-                    'success': True,
-                    'original_pdf': str(original_pdf.resolve()),  # Absolute path
-                    'text_file': str(text_file),
-                    'file_type': 'medical_bill',
-                    'model_used': self.model_name,
-                    'response_time': f"{elapsed:.1f}s",
-                    'extracted_data': extracted_data,
-                    'raw_response': ai_response
-                }
-                
-                results.append(result)
-                
-                # Show progress
-                found_count = sum(1 for v in extracted_data.values() if v != "NOT FOUND")
-                print(f"  ✓ Extracted {found_count}/{len(fields)} fields ({elapsed:.1f}s)")
-                
-                logging.info(f"Processed {text_file}: {found_count}/{len(fields)} fields")
-                
-            except Exception as e:
-                error_result = {
-                    'success': False,
-                    'original_pdf': str(original_pdf.resolve()),
-                    'text_file': str(text_file),
-                    'error': str(e)
-                }
-                results.append(error_result)
-                logging.error(f"Error processing {text_file}: {e}")
-        
-        print(f"✓ Processed {len(results)} bill files")
-        return results
-    
-    def write_csv_output(self, results: List[Dict]):
-        """Write results to output.csv with specified format."""
-        print("STEP 4: Writing results to output.csv...")
-        
+    def write_csv_record(self, result: Dict, is_first_record: bool = False):
+        """Write a single result to CSV immediately."""
         fields = self.config['medical_bill_fields']
         output_file = "output.csv"
         
@@ -458,39 +437,42 @@ EXTRACT NOW:"""
             'model_used'
         ] + fields
         
-        with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
+        # Determine if we need to write headers
+        file_exists = os.path.exists(output_file)
+        
+        with open(output_file, 'a', newline='', encoding='utf-8') as csvfile:
             writer = csv.writer(csvfile)
             
-            # Write headers
-            writer.writerow(headers)
+            # Write headers only for the very first record
+            if is_first_record and not file_exists:
+                writer.writerow(headers)
+                print(f"Created {output_file} with headers")
             
-            # Write data rows
-            for result in results:
-                if result.get('success'):
-                    row = [
-                        result['original_pdf'],
-                        result['file_type'],
-                        result['model_used']
-                    ]
-                    
-                    # Add field values in order
-                    for field in fields:
-                        value = result['extracted_data'].get(field, 'NOT FOUND')
-                        row.append(value)
-                    
-                    writer.writerow(row)
-                else:
-                    # Write error row
-                    error_row = [
-                        result.get('original_pdf', ''),
-                        'ERROR',
-                        result.get('error', 'Unknown error')
-                    ]
-                    error_row.extend([''] * len(fields))
-                    writer.writerow(error_row)
-        
-        print(f"✓ Results written to {output_file}")
-        logging.info(f"CSV output written to {output_file}")
+            # Write data row
+            if result.get('success'):
+                row = [
+                    result['original_pdf'],
+                    result['file_type'],
+                    result['model_used']
+                ]
+                
+                # Add field values in order
+                for field in fields:
+                    value = result['extracted_data'].get(field, 'NOT FOUND')
+                    row.append(value)
+                
+                writer.writerow(row)
+                print(f"  → Added record to output.csv")
+            else:
+                # Write error row
+                error_row = [
+                    result.get('original_pdf', ''),
+                    'ERROR',
+                    result.get('error', 'Unknown error')
+                ]
+                error_row.extend([''] * len(fields))
+                writer.writerow(error_row)
+                print(f"  → Added error record to output.csv")
     
     def process_all_bills(self):
         """Run the complete bill processing pipeline."""
@@ -519,8 +501,84 @@ EXTRACT NOW:"""
                 print("No bills were successfully converted. Processing complete.")
                 return
             
-            # Step 3: Extract data using AI (with incremental CSV writing)
-            results = self.extract_bill_data_incremental(text_files)
+            # Step 3: Extract data using AI (with immediate CSV writing)
+            if not text_files:
+                print("No text files to process.")
+                return
+                
+            print("STEP 3: Extracting bill data using qwen2.5:14b...")
+            
+            fields = self.config['medical_bill_fields']
+            all_results = []
+            
+            total_files = len(text_files)
+            first_record = True
+            
+            for i, (original_pdf, text_file) in enumerate(text_files, 1):
+                try:
+                    print(f"Processing {i}/{total_files}: {text_file.name}")
+                    
+                    # Read text file
+                    with open(text_file, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    
+                    # Limit content size for model processing
+                    if len(content) > 8000:
+                        content = content[:8000] + "\n[Content truncated...]"
+                    
+                    # Create extraction prompt
+                    prompt = self.create_extraction_prompt(content, fields)
+                    
+                    # Query model
+                    start_time = time.time()
+                    ai_response = self.query_model(prompt)
+                    elapsed = time.time() - start_time
+                    
+                    # Parse response
+                    extracted_data = self.parse_extraction_response(ai_response, fields)
+                    
+                    # Store result
+                    result = {
+                        'success': True,
+                        'original_pdf': str(original_pdf.resolve()),  # Absolute path
+                        'text_file': str(text_file),
+                        'file_type': 'medical_bill',
+                        'model_used': self.model_name,
+                        'response_time': f"{elapsed:.1f}s",
+                        'extracted_data': extracted_data,
+                        'raw_response': ai_response
+                    }
+                    
+                    # Write to CSV immediately
+                    self.write_csv_record(result, is_first_record=first_record)
+                    first_record = False
+                    
+                    all_results.append(result)
+                    
+                    # Show progress
+                    found_count = sum(1 for v in extracted_data.values() if v != "NOT FOUND")
+                    print(f"  ✓ Extracted {found_count}/{len(fields)} fields ({elapsed:.1f}s)")
+                    
+                    logging.info(f"Processed {text_file}: {found_count}/{len(fields)} fields")
+                    
+                except Exception as e:
+                    error_result = {
+                        'success': False,
+                        'original_pdf': str(original_pdf.resolve()),
+                        'text_file': str(text_file),
+                        'error': str(e)
+                    }
+                    
+                    # Write error to CSV immediately
+                    self.write_csv_record(error_result, is_first_record=first_record)
+                    first_record = False
+                    
+                    all_results.append(error_result)
+                    print(f"  ✗ Error: {e}")
+                    logging.error(f"Error processing {text_file}: {e}")
+            
+            print(f"\n✓ Processed {len(all_results)} bill files total")
+            results = all_results
             
             # Summary
             successful = sum(1 for r in results if r.get('success'))
@@ -592,7 +650,6 @@ Output:
     except Exception as e:
         print(f"Fatal error: {e}")
         sys.exit(1)
-
 
 
 if __name__ == "__main__":
